@@ -7,6 +7,7 @@ import glob
 import numpy as np
 import pandas as pd
 from skimage.transform import resize
+from sklearn.metrics import roc_auc_score
 
 ############################################################
 #  Utility
@@ -26,7 +27,7 @@ def get_id(image_fp):
 
 def read_image(image_fp, target_depth=None):
     """ Read using pydicom or openCV 
-    image_fp: Filepath of a gray image
+    image_fp: Filepath of a GRAY image
 
     Returns:
     image: Image with customized depth
@@ -51,7 +52,7 @@ def read_image(image_fp, target_depth=None):
 
 
 def gray2rgb(image):
-    """ Convert gray image to RGB image_dir
+    """ Convert gray image to RGB image
     """
     assert len(image.shape) == 2
     return np.stack((image,)*3, -1)    
@@ -319,7 +320,7 @@ def scale_csv_dir(csv_dir, scale_factor):
 
 
 ############################################################
-#  Preprocessing
+#  Visualize
 ############################################################
 from imgaug import augmenters as iaa
 
@@ -338,110 +339,61 @@ def visualize_aug(image_fp, aug, show=False, save_fp=None):
 
 
 ############################################################
-#  Classification
+#  MyClassifier
 ############################################################
 
-def compute_class_acc(target_csv_fp, gt_csv_fp):
-    """ Calculate the classification accuracy
-    target_csv_fp: filepath of csv with predicted label "Target" 
-    gt_csv_fp: groundtruth "Target" csv filepath 
-    """
-    df_target = pd.read_csv(target_csv_fp)
-    df_gt = pd.read_csv(gt_csv_fp)
-    # Assume both csvs contain 'Target' and 'patientId'columns
-    assert "Target" in df_target.columns and "patientId" in df_target.columns
-    assert "Target" in df_gt.columns and "patientId" in df_gt.columns
-    # Check if the csvs have the same group of patients
-    assert set(df_target["patientId"].tolist()) == set(df_gt["patientId"].tolist())
-    hit = 0
-    total = df_target.shape[0]
-    for idx, row in df_target.iterrows():
-        if row["Target"] == df_gt.loc[idx, "Target"]:
-            hit += 1
-    print("classification accuracy: ", hit/total)
-    return hit/total
-
-
-def update_submission(submission_csv_fp, target_csv_fp, output_csv_fp):
-    """ Update the MRCNN result based on the classification result 
-    """
-    df_submission = pd.read_csv(submission_csv_fp)
-    df_target = pd.read_csv(target_csv_fp)
-    df_out = df_submission.copy()
-    fp, fn = 0, 0
-    for idx, row in df_target.iterrows():
-        pid =row["patientId"]
-        if (row["Target"] == 0) and \
-        (not df_submission.loc[df_submission["patientId"]==pid, "PredictionString"].isnull().values.any()):
-            fp += 1
-            df_out.loc[df_submission["patientId"]==pid, "PredictionString"] = ""
-        if (row["Target"] == 1) and \
-        (df_submission.loc[df_submission["patientId"]==pid, "PredictionString"].isnull().values.any()):
-            fn +=1
-    df_out.to_csv(output_csv_fp, index=False)
-    print("false positive (modified): ", fp)
-    print("false negative (missing):  ", fn)
-
-
+#*** Training ***
 def prepare_csv(image_dir):
+    """ Note: for multi-class cls problem
+    """
     class_names = os.listdir(image_dir)
     num_classes = len(class_names)
-    save_fp = os.path.join(image_dir, "dataset.csv")
+    row =",".join(x for x in ["image_fp"]+class_names)+"\n"
     base_label = "0,"*num_classes
     base_label = base_label[:-1]
-
+    save_fp = os.path.join(image_dir,"data.csv")
     with open(save_fp, "w") as f:
-        first_row = "image_fp,"
-        for class_name in class_names:
-            first_row += class_name +","
-        first_row = first_row[:-1] + "\n"
-        f.write(first_row)
-
+        f.write(row)
         for i in range(num_classes):
             class_dir = os.path.join(image_dir, class_names[i])
             image_fps = glob.glob(class_dir + "/*.*")
-            ind = 2*i
             class_label = list(base_label)
-            class_label[ind] = '1'
+            class_label[2*i] = '1'
             class_label = "".join(class_label)
-            
             for image_fp in image_fps:
                 f.write(f"{image_fp},{class_label}\n")
-    
-    return class_names, save_fp
+    return save_fp
 
 
-############################################################
-#  CSV, DATAFRAME, TXT
-############################################################
-
-def get_csv_from_folder(folder_dir, class_name, label):
-    """ Generate csv from a image folder
-
-    Example: get_csv_from_folder("./pneumonia", "Target", "1")
-    """
-    save_dir = folder_dir[:-len(os.path.basename(folder_dir))-1]
-    save_fp = os.path.join(save_dir, os.path.basename(folder_dir)+".csv")
-
-    with open(save_fp,"w") as f:
-        f.write("patientId,"+class_name+"\n")
-        image_fps = glob.glob(folder_dir + "/*.*")
-        assert len(image_fps) != 0
-        for image_fp in image_fps:
-            f.write(f"{image_fp},{label}\n")
-    print("save csv at: ", save_fp)
+def prepare_dataset(split):
+    csv = None
+    tmp_csv = False
+    if os.path.isdir(split):
+        csv = prepare_csv(split)
+        tmp_csv = True
+    if os.path.isfile(csv):
+        csv = split
+    return csv, tmp_csv
 
 
-def combine_csv(csv_dir):
-    """
-    Example: combine_csv("./train")
-    """
-    df_out = pd.DataFrame()
-    csv_fps = glob.glob(csv_dir+"/*.csv")
-    assert len(csv_fps) != 0
-    for csv_fp in csv_fps:
-        df = pd.read_csv(csv_fp)
-        df_out = df_out.append(df)
-    save_fp = os.path.join(csv_dir, "combined.csv")
-    df_out.to_csv(save_fp, index=False)
-    print("save merged csv at: ", save_fp)
+#*** Testing ***
+def compute_auroc(csv_gt, csv_pred, save_fp=None):
+    df_gt   = pd.read_csv(csv_gt)
+    df_pred = pd.read_csv(csv_pred)
+    assert df_gt.columns.tolist()==df_pred.columns.tolist()
+    assert df_gt.iloc[:,0].tolist()==df_pred.iloc[:,0].tolist()
+    class_names = df_gt.columns.tolist()[1:]
+    y_gt = df_gt[class_names].as_matrix()
+    y_pred = df_pred[class_names].as_matrix()
+    if save_fp: f = open(save_fp, "w")
+    aurocs = []
+    for i in range(len(class_names)):
+        score = roc_auc_score(y_gt[:, i], y_pred[:,i])
+        aurocs.append(score)
+        print(f"{class_names[i]},{score}")
+        if save_fp: f.write(f"{class_names[i]},{score}\n")
+    mean_auroc = np.mean(aurocs)
+    print(f"mean auroc: {mean_auroc}")
+    if save_fp:
+        f.write("-------------------------\n")
+        f.write(f"mean auroc: {mean_auroc}")
